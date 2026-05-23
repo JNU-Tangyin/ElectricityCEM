@@ -19,14 +19,11 @@ WEATHER_PATH = os.path.join(BASE_DIR, "00.data/open-meteo-germany/data/open_mete
 OUTPUT_DIR = os.path.join(BASE_DIR, "00.data/preprocessed/german_households_weather/")
 
 # 窗口对齐配置
-# 原始窗口 311 小时
 GOLDEN_START = "2026-04-15 02:00:00"
 GOLDEN_END   = "2026-04-28 00:00:00"
 TRAIN_LEN = 287 
-
-# 核心常数
 PRICE_DIVISOR = 1.0 
-SELL_PRICE_RATIO = 0.9 
+SELL_PRICE_RATIO = 1.0 
 
 
 # ==========================================
@@ -59,7 +56,6 @@ def get_german_state(lat, lon):
     return 'Unknown'
 
 def find_nearest_weather_grid(lat, lon, grid_points):
-    """寻找最近的天气网格点"""
     distances = np.sqrt((grid_points[:, 0] - lat)**2 + (grid_points[:, 1] - lon)**2)
     return grid_points[np.argmin(distances)]
 
