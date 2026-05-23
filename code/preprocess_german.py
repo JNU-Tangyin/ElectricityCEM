@@ -8,19 +8,18 @@ from datetime import timedelta
 # ==========================================
 # 1. 配置与路径
 # ==========================================
-BASE_DIR = "/Users/shiyinqi/Documents/code/energy/"
-GEO_PATH = os.path.join(BASE_DIR, "00.data/raw/家庭经纬度信息.xlsx")
+BASE_DIR = "../energy/"
+GEO_PATH = os.path.join(BASE_DIR, "data/家庭经纬度信息.xlsx")
 ENERGY_PATHS = [
-    os.path.join(BASE_DIR, "00.data/raw/电量信息1-260415-260428.xlsx"),
-    os.path.join(BASE_DIR, "00.data/raw/电量信息2.xlsx")
+    os.path.join(BASE_DIR, "data/电量信息1-260415-260428.xlsx"),
 ]
-PRICE_PATH = os.path.join(BASE_DIR, "00.data/raw/电价260415~260428.xlsx")
-WEATHER_PATH = os.path.join(BASE_DIR, "00.data/open-meteo-germany/data/open_meteo_germany.csv")
-OUTPUT_DIR = os.path.join(BASE_DIR, "00.data/preprocessed/german_households_weather/")
+PRICE_PATH = os.path.join(BASE_DIR, "data/电价260415~260428.xlsx")
+WEATHER_PATH = os.path.join(BASE_DIR, "data/open-meteo-germany/data/open_meteo_germany.csv")
+OUTPUT_DIR = os.path.join(BASE_DIR, "data/preprocessed/german_households_weather/")
 
 # 窗口对齐配置
-GOLDEN_START = "2026-04-15 02:00:00"
-GOLDEN_END   = "2026-04-28 00:00:00"
+START = "2026-04-15 02:00:00"
+END   = "2026-04-28 00:00:00"
 TRAIN_LEN = 287 
 PRICE_DIVISOR = 1.0 
 SELL_PRICE_RATIO = 1.0 
@@ -132,16 +131,16 @@ def main():
         h_hourly = h_hourly.join(h_weather[weather_features], how='left')
 
         # 6. 窗口裁剪
-        h_hourly = h_hourly.sort_index().loc[GOLDEN_START:GOLDEN_END]
+        h_hourly = h_hourly.sort_index().loc[START:END]
         
         # 插值补全细微空洞
         h_hourly = h_hourly.interpolate(method='linear', limit=2)
 
-        # 生成电价预测窗 (shift 会在末尾产生 NaN)
+        # 生成电价预测窗
         for i in range(1, 25):
             h_hourly[f'price_eur_kwh_t+{i}'] = h_hourly['price_eur_kwh'].shift(-i)
             
-        # 生成天气预测窗 (未来 6 小时辐射)
+        # 生成天气预测窗
         for i in range(1, 7):
             h_hourly[f'shortwave_radiation_t+{i}'] = h_hourly['shortwave_radiation'].shift(-i)
 
