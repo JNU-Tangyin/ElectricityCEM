@@ -8,141 +8,159 @@ import numpy as np
 import pandas as pd
 from energy_storage_env import EnergyStorageEnv
 
+# ==========================================
+# 训练超参数
+# ==========================================
 N_ITER = 300
-POP_SIZE = 100
-ELITE_SIZE = 10
-ALPHA = 0.8
-MIN_SIGMA = 1e-2
-EPISODE_LEN = 24 
+POP_SIZE = 150
+ELITE_SIZE = 20
+ALPHA = 0.85
+MIN_SIGMA = 0.05
+MAX_W = 1.5
+EPISODE_LEN_TRAIN = 72
+N_TRAIN_WINDOWS = 3
 
-
-def train_single_household(args):
-    (
-        hid,
-        csv_path,
-        save_path,
-        sell_ratio,
-        episode_len,
-        n_iter,
-        pop_size,
-        elite_size,
-        alpha,
-    ) = args
-
-    np.random.seed(os.getpid() + int(time.time() * 1000) % 10000)
+def train_with_history(args):
+    hid, csv_path, save_path, sell_ratio, skip_existing = args
+    if skip_existing and os.path.exists(save_path):
+        return {"household": hid, "status": "skipped"}
+    
+    history_path = save_path.replace("_expert.npy", "_history.csv")
+    rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+    
+    val_len = 96
+    if len(df) < EPISODE_LEN_TRAIN + val_len:
+        return {"household": hid, "status": "error", "reason": "data_too_short"}
+    
+    split_idx = len(df) - val_len
+    train_df = df.iloc[:split_idx].copy()
+    val_df = df.iloc[split_idx:].copy()
+    val_eval_len = val_len - 24
 
-    env = EnergyStorageEnv(
-        df,
-        episode_length_hours=episode_len,
-        sell_price_ratio=sell_ratio,
-        action_penalty_coef=0.0,
-    )
-    policy_dim = env.observation_space.shape[0] + 1
+    env = EnergyStorageEnv(train_df, episode_length_hours=EPISODE_LEN_TRAIN, sell_price_ratio=sell_ratio, action_penalty_coef=0.0)
+    env_val = EnergyStorageEnv(val_df, episode_length_hours=val_eval_len, sell_price_ratio=sell_ratio, action_penalty_coef=0.0)
+    
+    try:
+        policy_dim = env.observation_space.shape[0] + 1
+        mu = rng.uniform(-0.1, 0.1, size=policy_dim)
+        sigma = np.ones(policy_dim) * 0.5
 
-    mu = np.random.uniform(-1.0, 1.0, size=policy_dim)
-    sigma = np.ones(policy_dim) * 0.5
+        best_mu = mu.copy()
+        best_profit = -np.inf
+        history = []
 
-    best_mu = mu.copy()
-    best_reward = -np.inf
-    max_start = max(0, len(df) - episode_len - 24)
+        # ==========================================
+        # CEM 核心训练循环
+        # 交叉熵方法（CEM）通过不断缩小“优秀参数”的搜索范围来实现进化。
+        # 相比于随机搜索，它能更快地向高收益区域靠拢；相比于梯度下降，它不需要计算复杂的导数。
+        # ==========================================
+        for i in range(N_ITER):
+            # 1. 种群采样：从当前的正态分布 (mu, sigma) 中生成 POP_SIZE 个候选策略向量。
+            population = rng.normal(loc=mu, scale=sigma, size=(POP_SIZE, policy_dim))
+            # 限制权重幅度，防止 tanh 进入饱和区导致策略失效。
+            population = np.clip(population, -MAX_W, MAX_W)
+            
+            rewards = []
+            for W in population:
+                # 2. 蒙特卡洛评估：
+                # 电力环境具有高度的随机性（某天电价极高可能纯属运气），
+                # 因此我们选择 N_TRAIN_WINDOWS 个不同的时间起点进行测试并取均值。
+                win_profits = []
+                for _ in range(N_TRAIN_WINDOWS):
+                    t_start = rng.integers(0, max(1, len(train_df) - EPISODE_LEN_TRAIN - 24))
+                    state, _ = env.reset(options={"start_idx": t_start})
+                    ep_profit = 0.0
+                    while True:
+                        # 执行线性控制策略
+                        action_val = np.tanh(np.dot(W[:-1], state) + W[-1])
+                        state, _, done, _, info = env.step(np.array([action_val]))
+                        ep_profit += info["profit"]
+                        if done: break
+                    win_profits.append(ep_profit / EPISODE_LEN_TRAIN)
+                rewards.append(np.mean(win_profits))
 
-    for _ in range(n_iter):
-        population = np.random.normal(loc=mu, scale=sigma, size=(pop_size, policy_dim))
-        train_start = np.random.randint(0, max_start) if max_start > 0 else 0
+            # 3. 精英筛选：根据得分排序，选出表现最好的前 ELITE_SIZE 个策略。
+            elite_idxs = np.array(rewards).argsort()[-ELITE_SIZE:]
+            elites = population[elite_idxs]
+            
+            # 4. 分布更新：
+            # 将下一代的搜索中心 (mu) 移向本代精英的平均值，将搜索半径 (sigma) 缩小。
+            # ALPHA 平滑因子确保了进化的稳健性，防止单代异常导致模型异常。
+            mu = ALPHA * mu + (1 - ALPHA) * elites.mean(axis=0)
+            sigma = ALPHA * sigma + (1 - ALPHA) * np.maximum(elites.std(axis=0), MIN_SIGMA)
 
-        rewards = []
-        for W in population:
-            state, _ = env.reset(options={"start_idx": train_start})
-            ep_reward = 0.0
-            for _ in range(episode_len):
-                action_val = np.tanh(np.dot(W[:-1], state) + W[-1])
-                state, _, done, _, info = env.step(np.array([action_val]))
-                ep_reward += info["profit"]
-                if done:
-                    break
-            rewards.append(ep_reward / episode_len)
+            # 5. 跨时段泛化验证：
+            # 即便在训练集上表现优异，也可能只是记住了历史。
+            # 我们在从未见过的 val_df 上评估当前中心策略 mu 的表现。
+            state, _ = env_val.reset(options={"start_idx": 0})
+            avg_eval_profit = 0.0
+            while True:
+                action_val = np.tanh(np.dot(mu[:-1], state) + mu[-1])
+                state, _, done, _, info = env_val.step(np.array([action_val]))
+                avg_eval_profit += info["profit"]
+                if done: break
+            avg_eval_profit /= val_eval_len
+            
+            history.append({'iteration': i, 'mean_reward': np.mean(rewards), 'eval_profit': avg_eval_profit})
 
-        elite_idxs = np.array(rewards).argsort()[-elite_size:]
-        elites = population[elite_idxs]
-        mu = alpha * mu + (1 - alpha) * elites.mean(axis=0)
-        sigma = alpha * sigma + (1 - alpha) * np.maximum(elites.std(axis=0), MIN_SIGMA)
+            # 只保存泛化表现（验证集收益）最好的那一个版本。
+            if avg_eval_profit > best_profit:
+                best_profit = avg_eval_profit
+                best_mu = mu.copy()
 
-        state, _ = env.reset(options={"start_idx": 0})
-        eval_reward = 0.0
-        for _ in range(episode_len):
-            action_val = np.tanh(np.dot(mu[:-1], state) + mu[-1])
-            state, _, done, _, info = env.step(np.array([action_val]))
-            eval_reward += info["profit"]
-            if done:
-                break
-        eval_reward /= episode_len
+            if (i+1) % 50 == 0:
+                print(f"[{hid}] Iter {i+1:3d} | Best Profit: {best_profit:8.4f} EUR/h")
 
-        if eval_reward > best_reward:
-            best_reward = eval_reward
-            best_mu = mu.copy()
-
-    env.close()
-    np.save(save_path, best_mu)
-    return {
-        "household": hid,
-        "best_reward": best_reward,
-        "episode_len": episode_len,
-        "sell_ratio": sell_ratio,
-    }
-
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        np.save(save_path, best_mu)
+        pd.DataFrame(history).to_csv(history_path, index=False)
+        return {"household": hid, "status": "success", "profit": best_profit}
+    
+    finally:
+        env.close()
+        env_val.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Train per-household expert vectors.")
-    parser.add_argument("--ratio", type=float, required=True, help="Sell/buy price ratio.")
-    parser.add_argument(
-        "--episode-len",
-        type=int,
-        default=EPISODE_LEN,
-        help="CEM episode length in hours (24 ~= old smooth demo; 168 = aggressive arbitrage).",
-    )
-    parser.add_argument("--n-iter", type=int, default=N_ITER)
-    parser.add_argument("--pop-size", type=int, default=POP_SIZE)
-    parser.add_argument("--elite-size", type=int, default=ELITE_SIZE)
-    parser.add_argument("--alpha", type=float, default=ALPHA)
+    # ==========================================
+    # 路径管理与参数解析
+    # ==========================================
+    parser = argparse.ArgumentParser(description="德国家庭储能 CEM 训练脚本")
+    parser.add_argument("--data_dir", type=str, required=True, help="预处理后的 CSV 数据文件夹路径")
+    parser.add_argument("--output_dir", type=str, required=True, help="训练结果 (expert.npy) 保存目录")
+    parser.add_argument("--ratio", type=float, default=1.0, help="卖电/买电价格比例 (sell_price_ratio)")
+    parser.add_argument("--skip-existing", action="store_true", help="如果已存在结果则跳过")
+    parser.add_argument("--workers", type=int, default=None, help="并行训练的进程数")
     args = parser.parse_args()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.dirname(os.path.dirname(script_dir))
-    data_dir = os.path.join(base_dir, "00.data/preprocessed/german_households_weather")
-    output_dir = os.path.join(base_dir, f"04.results/expert_vectors_71_ratio_{args.ratio}")
+    data_dir = args.data_dir
+    output_dir = args.output_dir
 
-    os.makedirs(output_dir, exist_ok=True)
+    print(f">>> 数据来源目录: {data_dir}")
+    print(f">>> 结果保存目录: {output_dir}")
+
+    if not os.path.exists(data_dir):
+        print(f"错误：找不到数据目录 {data_dir}，请检查输入。")
+        return
+
     csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
-
     tasks = [
         (
-            os.path.basename(f).replace(".csv", ""),
-            f,
-            os.path.join(output_dir, f"{os.path.basename(f).replace('.csv', '')}_expert.npy"),
-            args.ratio,
-            args.episode_len,
-            args.n_iter,
-            args.pop_size,
-            args.elite_size,
-            args.alpha,
-        )
-        for f in csv_files
+            os.path.basename(f).replace(".csv", ""), 
+            f, 
+            os.path.join(output_dir, f"{os.path.basename(f).replace('.csv', '')}_expert.npy"), 
+            args.ratio, 
+            args.skip_existing
+        ) for f in csv_files
     ]
 
-    print(
-        f">>> Training ratio={args.ratio}, episode={args.episode_len}h, "
-        f"iter={args.n_iter}, pop={args.pop_size} -> {output_dir}"
-    )
-    num_cores = max(1, multiprocessing.cpu_count() - 2)
+    num_cores = args.workers or max(1, multiprocessing.cpu_count() - 2)
+    print(f">>> 训练启动: Ratio={args.ratio} | 进程数={num_cores}")
+    
+    time_start = time.time()
     with multiprocessing.Pool(processes=num_cores) as pool:
-        results = pool.map(train_single_household, tasks)
-
-    pd.DataFrame(results).to_csv(
-        os.path.join(output_dir, "evolution_summary.csv"), index=False
-    )
-    print(">>> Done.")
-
+        pool.map(train_with_history, tasks)
+    print(f">>> 训练完成，耗时: {(time.time() - time_start)/60:.1f} min.")
 
 if __name__ == "__main__":
     main()

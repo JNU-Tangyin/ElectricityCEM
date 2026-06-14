@@ -4,26 +4,29 @@ import numpy as np
 import os
 import json
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # 1. 配置与路径
 # ==========================================
-BASE_DIR = "../energy/"
-GEO_PATH = os.path.join(BASE_DIR, "data/家庭经纬度信息.xlsx")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+GEO_PATH = os.path.join(BASE_DIR, "00.data/raw/家庭经纬度信息.xlsx")
 ENERGY_PATHS = [
-    os.path.join(BASE_DIR, "data/电量信息1-260415-260428.xlsx"),
+    os.path.join(BASE_DIR, "00.data/raw/电量信息1-260415-260428.xlsx"),
+    os.path.join(BASE_DIR, "00.data/raw/电量信息2.xlsx")
 ]
-PRICE_PATH = os.path.join(BASE_DIR, "data/电价260415~260428.xlsx")
-WEATHER_PATH = os.path.join(BASE_DIR, "data/open-meteo-germany/data/open_meteo_germany.csv")
-OUTPUT_DIR = os.path.join(BASE_DIR, "data/preprocessed/german_households_weather/")
+PRICE_PATH = os.path.join(BASE_DIR, "00.data/raw/电价260415~260428.xlsx")
+WEATHER_PATH = os.path.join(BASE_DIR, "00.data/open-meteo-germany/data/open_meteo_germany.csv")
+OUTPUT_DIR = os.path.join(BASE_DIR, "00.data/preprocessed/german_households_weather/")
 
 # 窗口对齐配置
-START = "2026-04-15 02:00:00"
-END   = "2026-04-28 00:00:00"
+GOLDEN_START = "2026-04-15 02:00:00"
+GOLDEN_END   = "2026-04-28 00:00:00"
 TRAIN_LEN = 287 
 PRICE_DIVISOR = 1.0 
 SELL_PRICE_RATIO = 1.0 
-
 
 # ==========================================
 # 2. 辅助函数
@@ -55,6 +58,7 @@ def get_german_state(lat, lon):
     return 'Unknown'
 
 def find_nearest_weather_grid(lat, lon, grid_points):
+    """寻找最近的天气网格点"""
     distances = np.sqrt((grid_points[:, 0] - lat)**2 + (grid_points[:, 1] - lon)**2)
     return grid_points[np.argmin(distances)]
 
@@ -64,8 +68,11 @@ def main():
     # 1. 加载天气数据
     print(">>> 正在加载并索引天气数据...")
     df_weather = pd.read_csv(WEATHER_PATH)
-    # 将 UTC 时间转为德国本地时间 (UTC+2)
-    df_weather['timestamp_local'] = pd.to_datetime(df_weather['time_utc']) + timedelta(hours=2)
+    
+    # 德国本地时间 = UTC + Berlin Timezone
+    df_weather['timestamp_utc'] = pd.to_datetime(df_weather['time_utc']).dt.tz_localize('UTC')
+    df_weather['timestamp_local'] = df_weather['timestamp_utc'].dt.tz_convert('Europe/Berlin').dt.tz_localize(None)
+    
     unique_grids = df_weather[['requested_latitude', 'requested_longitude']].drop_duplicates().values
     
     # 2. 加载家庭地理与电价数据
@@ -131,7 +138,7 @@ def main():
         h_hourly = h_hourly.join(h_weather[weather_features], how='left')
 
         # 6. 窗口裁剪
-        h_hourly = h_hourly.sort_index().loc[START:END]
+        h_hourly = h_hourly.sort_index().loc[GOLDEN_START:GOLDEN_END]
         
         # 插值补全细微空洞
         h_hourly = h_hourly.interpolate(method='linear', limit=2)
@@ -153,7 +160,7 @@ def main():
             skip_log.append({'hid': hid, 'reason': 'Minimal PV peak power'})
             continue
 
-        # 时间与单位转换
+        # 时间与单位转换 (统一使用 Wh)
         h_hourly['hour_of_day'] = h_hourly.index.hour
         h_hourly['day_of_week'] = h_hourly.index.dayofweek
         h_hourly['day_of_year'] = h_hourly.index.dayofyear
@@ -162,13 +169,15 @@ def main():
         h_hourly['user_load_wh'] = h_hourly['loadSum'] * 1000.0
         
         # 基准收益计算
-        sell_p = h_hourly['price_eur_kwh'] * SELL_PRICE_RATIO
-        pv_to_load_kwh = np.minimum(h_hourly['pv_gen_wh'], h_hourly['user_load_wh']) / 1000.0
-        pv_to_grid_kwh = (h_hourly['pv_gen_wh'] - (pv_to_load_kwh * 1000.0)) / 1000.0
-        grid_to_load_kwh = (h_hourly['user_load_wh'] - (pv_to_load_kwh * 1000.0)) / 1000.0
-        h_hourly['baseline_reward'] = (pv_to_load_kwh * h_hourly['price_eur_kwh']) + \
-                                      (pv_to_grid_kwh * sell_p) - \
-                                      (grid_to_load_kwh * h_hourly['price_eur_kwh'])
+        buy_p = h_hourly['price_eur_kwh']
+        sell_p = buy_p * SELL_PRICE_RATIO
+        pv_to_load_wh = np.minimum(h_hourly['pv_gen_wh'], h_hourly['user_load_wh'])
+        rem_pv_wh = np.maximum(0, h_hourly['pv_gen_wh'] - pv_to_load_wh)
+        rem_load_wh = np.maximum(0, h_hourly['user_load_wh'] - pv_to_load_wh)
+        
+        h_hourly['baseline_reward'] = (pv_to_load_wh / 1000.0 * buy_p) + \
+                                      (rem_pv_wh / 1000.0 * sell_p) - \
+                                      (rem_load_wh / 1000.0 * buy_p)
         
         # 存盘
         h_hourly['lat'], h_hourly['lon'], h_hourly['state'] = lat, lon, state
@@ -184,6 +193,11 @@ def main():
         h_hourly[save_cols].to_csv(os.path.join(OUTPUT_DIR, f"{hid}.csv"))
         success_count += 1
         if success_count % 20 == 0: print(f"进度: 已处理 {success_count} 户...")
+
+    # 保存 skip_log 到 CSV
+    if skip_log:
+        pd.DataFrame(skip_log).to_csv(os.path.join(OUTPUT_DIR, "skip_log.csv"), index=False)
+        print(f">>> 已记录跳过户数: {len(skip_log)}，详见 skip_log.csv")
 
     print(f"\n>>> 预处理完成。成功: {success_count} 户。数据存放于 {OUTPUT_DIR}")
 
