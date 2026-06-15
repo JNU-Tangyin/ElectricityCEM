@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import pandas as pd
 import numpy as np
 import os
@@ -7,21 +8,8 @@ from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 # ==========================================
-# 1. 配置与路径
-# ==========================================
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
-
-GEO_PATH = os.path.join(BASE_DIR, "00.data/raw/家庭经纬度信息.xlsx")
-ENERGY_PATHS = [
-    os.path.join(BASE_DIR, "00.data/raw/电量信息1-260415-260428.xlsx"),
-    os.path.join(BASE_DIR, "00.data/raw/电量信息2.xlsx")
-]
-PRICE_PATH = os.path.join(BASE_DIR, "00.data/raw/电价260415~260428.xlsx")
-WEATHER_PATH = os.path.join(BASE_DIR, "00.data/open-meteo-germany/data/open_meteo_germany.csv")
-OUTPUT_DIR = os.path.join(BASE_DIR, "00.data/preprocessed/german_households_weather/")
-
 # 窗口对齐配置
+# ==========================================
 GOLDEN_START = "2026-04-15 02:00:00"
 GOLDEN_END   = "2026-04-28 00:00:00"
 TRAIN_LEN = 287 
@@ -29,7 +17,7 @@ PRICE_DIVISOR = 1.0
 SELL_PRICE_RATIO = 1.0 
 
 # ==========================================
-# 2. 辅助函数
+# 辅助地理信息
 # ==========================================
 GERMAN_STATES = {
     'Bayern': [47.2, 50.6, 8.9, 13.8],
@@ -58,37 +46,49 @@ def get_german_state(lat, lon):
     return 'Unknown'
 
 def find_nearest_weather_grid(lat, lon, grid_points):
-    """寻找最近的天气网格点"""
+    #寻找最近的天气网格点
     distances = np.sqrt((grid_points[:, 0] - lat)**2 + (grid_points[:, 1] - lon)**2)
     return grid_points[np.argmin(distances)]
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # ==========================================
+    # 路径管理与参数解析
+    # ==========================================
+    parser = argparse.ArgumentParser(description="德国家庭储能数据预处理工具")
+    parser.add_argument("--geo_path", type=str, required=True, help="家庭经纬度信息 (.xlsx) 路径")
+    parser.add_argument("--energy_path1", type=str, required=True, help="电量信息文件 1 (.xlsx) 路径")
+    parser.add_argument("--energy_path2", type=str, required=True, help="电量信息文件 2 (.xlsx) 路径")
+    parser.add_argument("--price_path", type=str, required=True, help="电价信息 (.xlsx) 路径")
+    parser.add_argument("--weather_path", type=str, required=True, help="天气数据 (.csv) 路径")
+    parser.add_argument("--output_dir", type=str, required=True, help="预处理后 CSV 的输出目录")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
     
     # 1. 加载天气数据
     print(">>> 正在加载并索引天气数据...")
-    df_weather = pd.read_csv(WEATHER_PATH)
+    df_weather = pd.read_csv(args.weather_path)
     
-    # 德国本地时间 = UTC + Berlin Timezone
     df_weather['timestamp_utc'] = pd.to_datetime(df_weather['time_utc']).dt.tz_localize('UTC')
     df_weather['timestamp_local'] = df_weather['timestamp_utc'].dt.tz_convert('Europe/Berlin').dt.tz_localize(None)
     
     unique_grids = df_weather[['requested_latitude', 'requested_longitude']].drop_duplicates().values
     
     # 2. 加载家庭地理与电价数据
-    print(">>> 正在加载原始电量与电价数据...")
-    df_geo = pd.read_excel(GEO_PATH).dropna(subset=['id'])
+    print(">>> 正在加载原始地理与电价数据...")
+    df_geo = pd.read_excel(args.geo_path).dropna(subset=['id'])
     df_geo['id'] = df_geo['id'].astype(np.int64)
     german_geo = df_geo[df_geo['country'] == 'Germany'].copy()
     
-    df_price = pd.read_excel(PRICE_PATH)
+    df_price = pd.read_excel(args.price_path)
     df_price['timestamp'] = pd.to_datetime(df_price['startTime']).dt.floor('15min')
     df_price.set_index('timestamp', inplace=True)
     df_price = df_price.ffill().bfill()
     
     # 3. 加载电量数据并去重
+    print(">>> 正在合并电量记录...")
     all_energy_dfs = []
-    for path in ENERGY_PATHS:
+    for path in [args.energy_path1, args.energy_path2]:
         if os.path.exists(path):
             xl = pd.ExcelFile(path)
             for sheet in xl.sheet_names:
@@ -98,8 +98,6 @@ def main():
     df_energy_all['timestamp'] = pd.to_datetime(df_energy_all['statStartTime']).dt.floor('15min')
     df_energy_all = df_energy_all.drop_duplicates(subset=['plantId', 'timestamp'])
     
-    print(f">>> 数据就绪。| 原始记录总行数: {len(df_energy_all)}")
-
     success_count = 0
     skip_log = []
 
@@ -190,16 +188,13 @@ def main():
                     [f'shortwave_radiation_t+{i}' for i in range(1, 7)] + \
                     ['hour_of_day', 'day_of_week', 'day_of_year', 'day_of_month', 'lat', 'lon', 'country', 'state', 'baseline_reward']
         
-        h_hourly[save_cols].to_csv(os.path.join(OUTPUT_DIR, f"{hid}.csv"))
+        h_hourly[save_cols].to_csv(os.path.join(args.output_dir, f"{hid}.csv"))
         success_count += 1
         if success_count % 20 == 0: print(f"进度: 已处理 {success_count} 户...")
 
-    # 保存 skip_log 到 CSV
     if skip_log:
-        pd.DataFrame(skip_log).to_csv(os.path.join(OUTPUT_DIR, "skip_log.csv"), index=False)
-        print(f">>> 已记录跳过户数: {len(skip_log)}，详见 skip_log.csv")
-
-    print(f"\n>>> 预处理完成。成功: {success_count} 户。数据存放于 {OUTPUT_DIR}")
+        pd.DataFrame(skip_log).to_csv(os.path.join(args.output_dir, "skip_log.csv"), index=False)
+    print(f"\n>>> 预处理完成。成功: {success_count} 户。数据保存至: {args.output_dir}")
 
 if __name__ == "__main__":
     main()
