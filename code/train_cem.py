@@ -8,6 +8,13 @@ import numpy as np
 import pandas as pd
 from energy_storage_env import EnergyStorageEnv
 
+# 交付包目录结构固定为 06.github/code/(本脚本) 与同级的 06.github/data、06.github/results，
+# 用脚本自身路径推导默认值，保证换一台机器、换一个安装路径都能直接运行，不依赖任何人的本地绝对路径。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_BASE = os.path.dirname(_SCRIPT_DIR)
+DEFAULT_DATA_DIR = os.path.join(_DEFAULT_BASE, "data")
+DEFAULT_OUTPUT_DIR = os.path.join(_DEFAULT_BASE, "results")
+
 # ==========================================
 # 训练超参数
 # ==========================================
@@ -21,26 +28,34 @@ EPISODE_LEN_TRAIN = 72
 N_TRAIN_WINDOWS = 3
 
 def train_with_history(args):
-    hid, csv_path, save_path, sell_ratio, skip_existing = args
+    hid, csv_path, save_path, sell_ratio, skip_existing, seed_seq = args
     if skip_existing and os.path.exists(save_path):
         return {"household": hid, "status": "skipped"}
-    
+
     history_path = save_path.replace("_expert.npy", "_history.csv")
-    rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+    # seed_seq 是从全局 --seed 派生出的该户专属子种子（见 main() 里的 SeedSequence.spawn），
+    # 保证同一个全局种子重跑整批训练能得到完全一致的结果，同时各户之间的随机数互不相关。
+    rng = np.random.default_rng(seed_seq)
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-    
+
     val_len = 96
-    if len(df) < EPISODE_LEN_TRAIN + val_len:
+    # +1：训练窗口起点采样需要 len(train_df) > EPISODE_LEN_TRAIN 才有余量（见下面 -1 的注释），
+    # 否则 len(df) 恰好等于 EPISODE_LEN_TRAIN+val_len 时 train_df 长度会正好等于 EPISODE_LEN_TRAIN，
+    # 训练循环最后一步会在 step() 里越界（IndexError）。
+    if len(df) < EPISODE_LEN_TRAIN + val_len + 1:
         return {"household": hid, "status": "error", "reason": "data_too_short"}
-    
+
     split_idx = len(df) - val_len
     train_df = df.iloc[:split_idx].copy()
     val_df = df.iloc[split_idx:].copy()
-    val_eval_len = val_len - 24
+    # -1 是必须的：EnergyStorageEnv.step() 即便在最后一步 (done=True) 也会用
+    # 递增后的 current_step 再调用一次 _get_obs()，所以 episode 长度必须比
+    # 可用行数少 1，否则最后一步会越界（IndexError）。
+    val_eval_len = val_len - 1
 
     env = EnergyStorageEnv(train_df, episode_length_hours=EPISODE_LEN_TRAIN, sell_price_ratio=sell_ratio, action_penalty_coef=0.0)
     env_val = EnergyStorageEnv(val_df, episode_length_hours=val_eval_len, sell_price_ratio=sell_ratio, action_penalty_coef=0.0)
-    
+
     try:
         policy_dim = env.observation_space.shape[0] + 1
         mu = rng.uniform(-0.1, 0.1, size=policy_dim)
@@ -60,7 +75,7 @@ def train_with_history(args):
             population = rng.normal(loc=mu, scale=sigma, size=(POP_SIZE, policy_dim))
             # 限制权重幅度，防止 tanh 进入饱和区导致策略失效。
             population = np.clip(population, -MAX_W, MAX_W)
-            
+
             rewards = []
             for W in population:
                 # 2. 蒙特卡洛评估：
@@ -68,7 +83,10 @@ def train_with_history(args):
                 # 因此我们选择 N_TRAIN_WINDOWS 个不同的时间起点进行测试并取均值。
                 win_profits = []
                 for _ in range(N_TRAIN_WINDOWS):
-                    t_start = rng.integers(0, max(1, len(train_df) - EPISODE_LEN_TRAIN - 24))
+                    # max(0, ...) 是最大允许起点（含），rng.integers 的 high 是排他的，
+                    # 所以要 +1 才能采样到这个边界值本身（跟 cem_core.py 保持一致）；
+                    # 其中的 -1 原因同 val_eval_len 那处注释。
+                    t_start = rng.integers(0, max(0, len(train_df) - EPISODE_LEN_TRAIN - 1) + 1)
                     state, _ = env.reset(options={"start_idx": t_start})
                     ep_profit = 0.0
                     while True:
@@ -83,7 +101,7 @@ def train_with_history(args):
             # 3. 精英筛选：根据得分排序，选出表现最好的前 ELITE_SIZE 个策略。
             elite_idxs = np.array(rewards).argsort()[-ELITE_SIZE:]
             elites = population[elite_idxs]
-            
+
             # 4. 分布更新：
             # 将下一代的搜索中心 (mu) 移向本代精英的平均值，将搜索半径 (sigma) 缩小。
             # ALPHA 平滑因子确保了进化的稳健性，防止单代异常导致模型异常。
@@ -101,7 +119,7 @@ def train_with_history(args):
                 avg_eval_profit += info["profit"]
                 if done: break
             avg_eval_profit /= val_eval_len
-            
+
             history.append({'iteration': i, 'mean_reward': np.mean(rewards), 'eval_profit': avg_eval_profit})
 
             # 只保存泛化表现（验证集收益）最好的那一个版本。
@@ -116,7 +134,7 @@ def train_with_history(args):
         np.save(save_path, best_mu)
         pd.DataFrame(history).to_csv(history_path, index=False)
         return {"household": hid, "status": "success", "profit": best_profit}
-    
+
     finally:
         env.close()
         env_val.close()
@@ -126,11 +144,12 @@ def main():
     # 路径管理与参数解析
     # ==========================================
     parser = argparse.ArgumentParser(description="德国家庭储能 CEM 训练脚本")
-    parser.add_argument("--data_dir", type=str, required=True, help="预处理后的 CSV 数据文件夹路径")
-    parser.add_argument("--output_dir", type=str, required=True, help="训练结果 (expert.npy) 保存目录")
+    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR, help="预处理后的 CSV 数据文件夹路径")
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR, help="训练结果 (expert.npy) 保存目录")
     parser.add_argument("--ratio", type=float, default=1.0, help="卖电/买电价格比例 (sell_price_ratio)")
     parser.add_argument("--skip-existing", action="store_true", help="如果已存在结果则跳过")
     parser.add_argument("--workers", type=int, default=None, help="并行训练的进程数")
+    parser.add_argument("--seed", type=int, default=42, help="全局随机种子，用于派生每户互相独立的训练种子（保证整批训练可复现）")
     args = parser.parse_args()
 
     data_dir = args.data_dir
@@ -144,19 +163,34 @@ def main():
         return
 
     csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+
+    # 每户从同一个全局种子派生出各自独立的子种子：SeedSequence.spawn 保证子种子之间
+    # 统计独立（不会像多个进程共用同一个种子那样产生跨户关联），且只要 --seed 和
+    # csv_files 的顺序不变，重跑整批训练能得到逐户完全一致的结果。
+    household_seeds = np.random.SeedSequence(args.seed).spawn(len(csv_files))
+
     tasks = [
         (
-            os.path.basename(f).replace(".csv", ""), 
-            f, 
-            os.path.join(output_dir, f"{os.path.basename(f).replace('.csv', '')}_expert.npy"), 
-            args.ratio, 
-            args.skip_existing
-        ) for f in csv_files
+            os.path.basename(f).replace(".csv", ""),
+            f,
+            os.path.join(output_dir, f"{os.path.basename(f).replace('.csv', '')}_expert.npy"),
+            args.ratio,
+            args.skip_existing,
+            household_seeds[i],
+        ) for i, f in enumerate(csv_files)
     ]
 
     num_cores = args.workers or max(1, multiprocessing.cpu_count() - 2)
-    print(f">>> 训练启动: Ratio={args.ratio} | 进程数={num_cores}")
-    
+    print(f">>> 训练启动: Ratio={args.ratio} | 全局种子={args.seed} | 进程数={num_cores}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "training_run_info.txt"), "w", encoding="utf-8") as f:
+        f.write(f"global_seed={args.seed}\n")
+        f.write(f"ratio={args.ratio}\n")
+        f.write(f"n_households={len(csv_files)}\n")
+        f.write(f"data_dir={data_dir}\n")
+        f.write(f"timestamp={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
     time_start = time.time()
     with multiprocessing.Pool(processes=num_cores) as pool:
         pool.map(train_with_history, tasks)
