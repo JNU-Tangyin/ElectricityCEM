@@ -1,0 +1,4 @@
+"seed_dir","n_households","n_sig_raw","n_sig_bh","min_p_bh","sig_households"
+"cem_seed0",71,0,0,0.998357866596161,""
+"cem_seed1",71,1,0,0.992497310300831,""
+"cem_seed42",71,0,0,0.995142470125842,""

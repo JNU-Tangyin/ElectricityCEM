@@ -1,0 +1,5 @@
+"space","k","min_jaccard_stability","mean_jaccard_stability","stable"
+"C_no_bias_loc",2,0.597270480674184,0.630701525096753,FALSE
+"C_no_bias_loc",3,0.653503563955558,0.711150885243773,TRUE
+"C_no_bias_loc",4,0.448356631764871,0.61163044720305,FALSE
+"C_no_bias_loc",5,0.458369202381763,0.61613664296301,FALSE

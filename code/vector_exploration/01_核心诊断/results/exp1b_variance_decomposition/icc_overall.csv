@@ -1,0 +1,2 @@
+n_households,n_seeds,n_dims,icc_overall_raw,icc_overall_clipped,var_between_sum,var_within_sum,n_dims_negative_component
+71,3,36,0.2104378626432345,0.21170920910204544,7.626638669007729,28.61512207315272,1

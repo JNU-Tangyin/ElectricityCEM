@@ -1,0 +1,16 @@
+seed,n_neighbors,d_0.2
+cem_seed0,5,9.0
+cem_seed0,7,11.0
+cem_seed0,10,
+cem_seed0,15,
+cem_seed0,20,
+cem_seed1,5,8.0
+cem_seed1,7,10.0
+cem_seed1,10,
+cem_seed1,15,
+cem_seed1,20,
+cem_seed42,5,5.0
+cem_seed42,7,12.0
+cem_seed42,10,
+cem_seed42,15,
+cem_seed42,20,
