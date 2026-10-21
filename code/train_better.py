@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""CEM 训练，与 train_cem.py 的区别是同一代内所有候选共用同一批训练窗口。
+"""
+CEM 训练，与 train_cem.py 的区别是同一代内所有候选共用同一批训练窗口。
+新增逐代的 mu/sigma 轨迹、单户计时与 checkpoint 代数记录，用于诊断收敛；
+超参数、validation 逐代挑 checkpoint、val_len=96 均保持一致。
 
-原来每个候选各自随机抽 N_TRAIN_WINDOWS 个窗口，于是两个候选的分数差里混入了「谁抽到
-的窗口更好赚」，而窗口之间的收益差异远大于候选之间的差异，精英筛选因此主要在选运气。
-共用之后比较变成配对的，窗口的难易被差分掉；换代时重抽，避免 mu 记住固定几段行情。
-
-对照同目录的 train_cem.py 还多了逐代的 mu/sigma 轨迹、单户计时与 checkpoint 代数记录，
-用于诊断收敛；超参数、validation 逐代挑 checkpoint、val_len=96 均保持一致。
-
-输出默认写到与 code/ 同级的 results_better/，不与 train_cem.py 的 results/ 混在一起。
 """
 import argparse
 import glob
