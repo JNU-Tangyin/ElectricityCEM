@@ -1,0 +1,5 @@
+global_seed=1
+ratio=1.0
+n_households=72
+data_dir=data
+timestamp=2026-09-10 10:37:19
